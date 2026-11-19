@@ -17,6 +17,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node = onvif_cam.camera_node:main',
+            'cam_gui = onvif_cam.gui_node:main',
         ],
     },
 )
