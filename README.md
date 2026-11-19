@@ -12,11 +12,20 @@ source install/setup.bash
 ros2 run onvif_cam camera_node
 ```
 
+別ターミナルでビューア兼ズーム GUI を起動:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ros2_ws/install/setup.bash
+ros2 run onvif_cam cam_gui
+```
+
 ## トピック
 
 | トピック | 型 | 内容 |
 |---|---|---|
-| `/onvif_cam/image_raw` | `sensor_msgs/Image` (bgr8) | カメラ映像 (QoS: RELIABLE, depth 1) |
+| `/onvif_cam/image_raw` | `sensor_msgs/Image` (bgr8) | カメラ映像 (QoS: RELIABLE, depth 1、購読者がいる時のみ配信) |
+| `/onvif_cam/image_raw/compressed` | `sensor_msgs/CompressedImage` (jpeg) | 低遅延 JPEG 圧縮映像 (QoS: RELIABLE, depth 1、購読者がいる時のみ配信) |
 | `/onvif_cam/zoom` | `std_msgs/Float32` | ズーム速度 -1.0 (広角) 〜 1.0 (望遠)、0 で停止。最後の指令から `zoom_timeout` 秒で自動停止 |
 
 ## パラメータ
@@ -25,7 +34,9 @@ ros2 run onvif_cam camera_node
 |---|---|---|
 | `host` | `192.168.1.123` | カメラの IP |
 | `stream` | `stream1` | `stream1` = 704x576, `stream0` = 2592x1944 |
-| `publish_rate` | `2.0` | 配信レート [Hz]。0 以下でカメラの全フレーム (約25fps) |
+| `rtsp_transport` | `tcp` | RTSP トランスポート (`tcp` / `udp`) |
+| `publish_rate` | `0.0` | 配信レート [Hz]。0 以下でカメラの全フレーム (約25fps) |
+| `jpeg_quality` | `80` | `/onvif_cam/image_raw/compressed` の JPEG 品質 (1〜100) |
 | `zoom_timeout` | `0.5` | ズーム自動停止までの秒数 |
 | `frame_id` | `camera` | 画像の frame_id |
 

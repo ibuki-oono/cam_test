@@ -1,4 +1,5 @@
-"""PyQt5 GUI for viewing /onvif_cam/image_raw and controlling /onvif_cam/zoom."""
+"""Low-latency PyQt5 GUI for viewing onvif_cam images and controlling /onvif_cam/zoom."""
+from collections import deque
 import signal
 import sys
 import threading
@@ -9,7 +10,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Float32
 
 
@@ -38,15 +39,29 @@ def ros_image_to_qimage(msg: Image) -> QtGui.QImage:
 
 
 class RosBridge(QtCore.QObject):
-    frame_received = QtCore.pyqtSignal(QtGui.QImage, int, int, str)
+    frame_ready = QtCore.pyqtSignal()
 
-    def __init__(self, node: Node, image_topic: str, zoom_topic: str):
+    def __init__(self, node: Node, image_topic: str, zoom_topic: str, use_compressed: bool = True):
         super().__init__()
         self.node = node
+        self.use_compressed = use_compressed
+        self.subscribed_topic = f'{image_topic}/compressed' if use_compressed else image_topic
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
-        self.sub = node.create_subscription(Image, image_topic, self._on_image, qos)
+        if use_compressed:
+            self.sub = node.create_subscription(
+                CompressedImage, self.subscribed_topic, self._on_compressed, qos
+            )
+        else:
+            self.sub = node.create_subscription(
+                Image, self.subscribed_topic, self._on_raw, qos
+            )
         self.pub = node.create_publisher(Float32, zoom_topic, 10)
-        self._lock = threading.Lock()
+
+        self._pub_lock = threading.Lock()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._emit_pending = False
+
         self._running = True
         self._thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._thread.start()
@@ -54,24 +69,57 @@ class RosBridge(QtCore.QObject):
     def _spin_loop(self):
         while self._running and rclpy.ok():
             try:
-                rclpy.spin_once(self.node, timeout_sec=0.05)
+                rclpy.spin_once(self.node, timeout_sec=0.02)
             except Exception:  # noqa: BLE001
                 break
 
-    def _on_image(self, msg: Image):
+    def _calc_latency_ms(self, stamp) -> float:
+        now_ns = self.node.get_clock().now().nanoseconds
+        stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        if stamp_ns <= 0:
+            return -1.0
+        return max(0.0, (now_ns - stamp_ns) / 1e6)
+
+    def _push_frame(self, qimg: QtGui.QImage, width: int, height: int, fmt: str, latency_ms: float):
+        should_emit = False
+        with self._frame_lock:
+            self._latest_frame = (qimg, width, height, fmt, latency_ms)
+            if not self._emit_pending:
+                self._emit_pending = True
+                should_emit = True
+        if should_emit:
+            self.frame_ready.emit()
+
+    def pop_latest_frame(self):
+        with self._frame_lock:
+            item = self._latest_frame
+            self._latest_frame = None
+            self._emit_pending = False
+        return item
+
+    def _on_compressed(self, msg: CompressedImage):
+        qimg = QtGui.QImage.fromData(bytes(msg.data))
+        if qimg.isNull():
+            self.node.get_logger().warn('Compressed image decode failed')
+            return
+        latency_ms = self._calc_latency_ms(msg.header.stamp)
+        self._push_frame(qimg, qimg.width(), qimg.height(), msg.format or 'jpeg', latency_ms)
+
+    def _on_raw(self, msg: Image):
         try:
             qimg = ros_image_to_qimage(msg)
         except Exception as e:  # noqa: BLE001
             self.node.get_logger().warn(f'Image decode failed: {e}')
             return
-        self.frame_received.emit(qimg, msg.width, msg.height, msg.encoding)
+        latency_ms = self._calc_latency_ms(msg.header.stamp)
+        self._push_frame(qimg, msg.width, msg.height, msg.encoding, latency_ms)
 
     def publish_zoom(self, speed: float):
         if not self._running or not rclpy.ok():
             return
         msg = Float32()
         msg.data = float(speed)
-        with self._lock:
+        with self._pub_lock:
             self.pub.publish(msg)
 
     def stop(self):
@@ -81,18 +129,20 @@ class RosBridge(QtCore.QObject):
 
 
 class CamGuiWindow(QtWidgets.QMainWindow):
-    def __init__(self, bridge: RosBridge, image_topic: str, zoom_topic: str):
+    def __init__(self, bridge: RosBridge, zoom_topic: str):
         super().__init__()
         self.bridge = bridge
-        self.image_topic = image_topic
+        self.image_topic = bridge.subscribed_topic
         self.zoom_topic = zoom_topic
 
-        self.setWindowTitle(f'ONVIF Camera Viewer ({image_topic})')
+        self.setWindowTitle(f'ONVIF Camera Viewer ({self.image_topic})')
         self.resize(840, 680)
 
         self._pixmap = None
         self._last_frame_time = None
+        self._frame_times = deque()
         self._fps = 0.0
+        self._latency_ms = -1.0
         self._frame_count = 0
         self._img_info = 'No image yet'
 
@@ -101,7 +151,7 @@ class CamGuiWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
 
-        self.bridge.frame_received.connect(self._on_frame)
+        self.bridge.frame_ready.connect(self._on_frame_ready)
 
         # Keep publishing zoom while button/key is held (camera_node watchdog default is 0.5s)
         self._zoom_timer = QtCore.QTimer(self)
@@ -179,16 +229,26 @@ class CamGuiWindow(QtWidgets.QMainWindow):
         self.statusBar().addWidget(self.status_label, 1)
         self._update_status_label()
 
-    def _on_frame(self, qimg: QtGui.QImage, width: int, height: int, encoding: str):
+    def _on_frame_ready(self):
+        item = self.bridge.pop_latest_frame()
+        if item is None:
+            return
+        qimg, width, height, encoding, latency_ms = item
         now = time.monotonic()
-        if self._last_frame_time is not None:
-            dt = now - self._last_frame_time
-            if dt > 0:
-                inst_fps = 1.0 / dt
-                self._fps = inst_fps if self._fps == 0.0 else (0.7 * self._fps + 0.3 * inst_fps)
+        self._frame_times.append(now)
+        while len(self._frame_times) > 2 and now - self._frame_times[0] > 1.5:
+            self._frame_times.popleft()
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                self._fps = (len(self._frame_times) - 1) / span
         self._last_frame_time = now
         self._frame_count += 1
         self._img_info = f'{width}x{height} ({encoding})'
+        if latency_ms >= 0.0:
+            self._latency_ms = (
+                latency_ms if self._latency_ms < 0.0 else (0.8 * self._latency_ms + 0.2 * latency_ms)
+            )
         self._pixmap = QtGui.QPixmap.fromImage(qimg)
         self._refresh_pixmap()
         self._update_status_label()
@@ -199,7 +259,7 @@ class CamGuiWindow(QtWidgets.QMainWindow):
         scaled = self._pixmap.scaled(
             self.video_label.size(),
             QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.SmoothTransformation,
+            QtCore.Qt.FastTransformation,
         )
         self.video_label.setPixmap(scaled)
 
@@ -239,7 +299,10 @@ class CamGuiWindow(QtWidgets.QMainWindow):
             if age > 3.0:
                 stream_state = f'Stale ({age:.1f}s ago) | {self._img_info}'
             else:
-                stream_state = f'{self._img_info} | {self._fps:.1f} FPS | frames: {self._frame_count}'
+                lat = f' | ROS: {self._latency_ms:.1f}ms' if self._latency_ms >= 0.0 else ''
+                stream_state = (
+                    f'{self._img_info} | {self._fps:.1f} FPS{lat} | frames: {self._frame_count}'
+                )
 
         if self._zoom_dir > 0:
             zoom_state = f'Zoom IN (+{self._zoom_speed:.2f})'
@@ -290,6 +353,7 @@ def main():
     node = Node('onvif_cam_gui')
     image_topic = node.declare_parameter('image_topic', '/onvif_cam/image_raw').value
     zoom_topic = node.declare_parameter('zoom_topic', '/onvif_cam/zoom').value
+    use_compressed = bool(node.declare_parameter('use_compressed', True).value)
 
     app = QtWidgets.QApplication(sys.argv)
     signal.signal(signal.SIGINT, lambda *_: app.quit())
@@ -299,8 +363,8 @@ def main():
     sig_timer.start(200)
     sig_timer.timeout.connect(lambda: None)
 
-    bridge = RosBridge(node, image_topic, zoom_topic)
-    win = CamGuiWindow(bridge, image_topic, zoom_topic)
+    bridge = RosBridge(node, image_topic, zoom_topic, use_compressed=use_compressed)
+    win = CamGuiWindow(bridge, zoom_topic)
     win.show()
 
     try:
